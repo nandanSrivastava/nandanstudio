@@ -172,7 +172,7 @@ export default function PhotoEditor({ imageSrc, onReset }: PhotoEditorProps) {
     setIsRemovingBg(true);
     try {
       const blob = await removeBackground(processedImage, {
-        model: "small", // Official high-speed model
+        model: "isnet_fp16", // Official high-speed fp16 model
         progress: (status, progress) => {
           console.log(`${status}: ${progress}`);
         }
