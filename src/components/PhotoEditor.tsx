@@ -590,6 +590,7 @@ export default function PhotoEditor({ imageSrc, onReset }: PhotoEditorProps) {
       const resizedBase64 = await resizeImageForWasm(processedImage, 800);
 
       const localBlob = await removeBackground(resizedBase64, {
+        publicPath: "https://unpkg.com/@imgly/background-removal@1.7.0/dist/",
         model: "isnet_quint8", // Smallest and fastest quantized model (~44MB)
         progress: (status, progress) => {
           console.log(`${status}: ${progress}`);
