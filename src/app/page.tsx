@@ -2,14 +2,13 @@
 
 import React, { useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Sparkles, Image as ImageIcon, FileText, ArrowRight, ArrowLeft } from "lucide-react";
+import { Sparkles, Image as ImageIcon, ArrowRight, ArrowLeft } from "lucide-react";
 import FileUpload from "@/components/FileUpload";
 import PhotoEditor from "@/components/PhotoEditor";
-import DocumentPreview from "@/components/DocumentPreview";
 
 export default function Home() {
   const [activeFile, setActiveFile] = useState<File | null>(null);
-  const [viewMode, setViewMode] = useState<"landing" | "photo" | "document">("landing");
+  const [viewMode, setViewMode] = useState<"landing" | "photo">("landing");
   const [imageSrc, setImageSrc] = useState<string | null>(null);
 
   React.useEffect(() => {
@@ -23,7 +22,7 @@ export default function Home() {
     return () => window.removeEventListener("beforeunload", handleBeforeUnload);
   }, [activeFile]);
 
-  const handleFileSelect = (file: File, mode: "photo" | "document") => {
+  const handleFileSelect = (file: File, mode: "photo") => {
     setActiveFile(file);
     setViewMode(mode);
     if (file.type.startsWith("image/")) {
@@ -36,7 +35,7 @@ export default function Home() {
   const reset = () => {
     setActiveFile(null);
     setImageSrc(null);
-    // Note: We keep the viewMode as 'photo' or 'document' so the user stays in that section
+    // Note: We keep the viewMode as 'photo' so the user stays in that section
   };
 
   const fullReset = () => {
@@ -48,14 +47,16 @@ export default function Home() {
   return (
     <main className="min-h-screen pt-8 pb-32 px-4">
       {/* Navbar */}
-      <nav className="max-w-6xl mx-auto flex items-center justify-between mb-12">
-        <div className="flex items-center gap-2 group cursor-default">
-          <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-primary to-brand-secondary flex items-center justify-center text-white shadow-lg shadow-primary/20 group-hover:scale-110 transition-transform">
-            <Sparkles className="w-6 h-6" />
+      <nav className="max-w-[1550px] mx-auto flex items-center justify-between mb-16 px-4">
+        <div className="flex items-center gap-0 group cursor-pointer hover:opacity-95 transition-all">
+          <div className="flex flex-col">
+            <span className="text-3xl font-black tracking-tight text-slate-900 leading-none">
+              Nandan <span className="bg-gradient-to-r from-indigo-600 via-purple-600 to-indigo-800 bg-clip-text text-transparent">Digital Studio</span>
+            </span>
+            <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest leading-none mt-2">
+              Elite Photography & Print Studio
+            </span>
           </div>
-          <span className="text-xl font-bold tracking-tight text-slate-800">
-            Nandan <span className="text-primary">Digital Studio</span>
-          </span>
         </div>
       </nav>
       
@@ -73,11 +74,11 @@ export default function Home() {
             </div>
             
             <h1 className="text-5xl md:text-7xl font-bold mb-6 tracking-tight text-slate-900">
-              Transform Your <span className="text-gradient">Photos & Docs</span>
+              Transform Your <span className="text-gradient">Photos & Visuals</span>
             </h1>
             
             <p className="text-lg md:text-xl text-slate-500 max-w-2xl mx-auto leading-relaxed">
-              Pro-grade cropping, AI background removal, and document processing. 
+              Pro-grade cropping, AI background removal, and professional image tuning. 
             </p>
           </motion.div>
         )}
@@ -92,36 +93,19 @@ export default function Home() {
               initial={{ opacity: 0, y: 20 }}
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, scale: 0.95 }}
-              className="grid md:grid-cols-2 gap-8 max-w-5xl mx-auto"
+              className="max-w-xl mx-auto flex flex-col"
             >
-              <div className="flex flex-col">
-                <div className="mb-4 flex items-center gap-3 text-slate-800 font-semibold">
-                  <div className="p-2 rounded-lg bg-indigo-100">
-                    <ImageIcon className="w-5 h-5 text-indigo-600" />
-                  </div>
-                  Photo Studio
+              <div className="mb-4 flex items-center justify-center gap-3 text-slate-800 font-bold uppercase tracking-wider text-xs">
+                <div className="p-2 rounded-xl bg-indigo-50 text-indigo-600 border border-indigo-100 shadow-sm flex items-center justify-center">
+                  <ImageIcon className="w-4 h-4" />
                 </div>
-                <FileUpload
-                  onFileSelect={(f) => handleFileSelect(f, "photo")}
-                  accept="image/*"
-                  label="Upload Photos"
-                />
+                Nandan Digital Studio
               </div>
-
-              <div className="flex flex-col">
-                <div className="mb-4 flex items-center gap-3 text-slate-800 font-semibold">
-                  <div className="p-2 rounded-lg bg-pink-100">
-                    <FileText className="w-5 h-5 text-pink-600" />
-                  </div>
-                  Document Hub
-                </div>
-                <FileUpload
-                  onFileSelect={(f) => handleFileSelect(f, "document")}
-                  accept=".pdf,.doc,.docx,.txt"
-                  label="Upload Documents"
-                  icon={<FileText className="w-8 h-8 text-pink-600/50" />}
-                />
-              </div>
+              <FileUpload
+                onFileSelect={(f) => handleFileSelect(f, "photo")}
+                accept="image/*"
+                label="Upload Photos to Edit"
+              />
             </motion.div>
           ) : viewMode === "photo" ? (
             <motion.div
@@ -141,43 +125,15 @@ export default function Home() {
                     <ArrowLeft className="w-4 h-4" /> Back to Home
                   </button>
                   <h2 className="text-3xl font-bold mb-8 flex items-center justify-center gap-3 text-slate-800">
-                    <ImageIcon className="w-8 h-8 text-indigo-600" />
-                    Photo Studio
+                    <div className="p-2.5 rounded-2xl bg-indigo-50 text-indigo-600 border border-indigo-100 shadow-sm flex items-center justify-center">
+                      <ImageIcon className="w-6 h-6" />
+                    </div>
+                    Nandan Digital Studio
                   </h2>
                   <FileUpload
                     onFileSelect={(f) => handleFileSelect(f, "photo")}
                     accept="image/*"
                     label="Select New Photo"
-                  />
-                </div>
-              )}
-            </motion.div>
-          ) : viewMode === "document" ? (
-            <motion.div
-              key="document-hub-view"
-              initial={{ opacity: 0, scale: 0.95 }}
-              animate={{ opacity: 1, scale: 1 }}
-              exit={{ opacity: 0, scale: 0.95 }}
-            >
-              {activeFile ? (
-                <DocumentPreview file={activeFile} onReset={reset} />
-              ) : (
-                <div className="max-w-xl mx-auto text-center">
-                  <button 
-                    onClick={fullReset}
-                    className="mb-8 text-slate-400 hover:text-slate-600 flex items-center gap-2 mx-auto transition-colors"
-                  >
-                    <ArrowLeft className="w-4 h-4" /> Back to Home
-                  </button>
-                  <h2 className="text-3xl font-bold mb-8 flex items-center justify-center gap-3 text-slate-800">
-                    <FileText className="w-8 h-8 text-pink-600" />
-                    Document Hub
-                  </h2>
-                  <FileUpload
-                    onFileSelect={(f) => handleFileSelect(f, "document")}
-                    accept=".pdf,.doc,.docx,.txt"
-                    label="Select New Document"
-                    icon={<FileText className="w-8 h-8 text-pink-600/50" />}
                   />
                 </div>
               )}
@@ -206,8 +162,8 @@ export default function Home() {
               color: "bg-purple-100 text-purple-600"
             },
             {
-              title: "High-Quality Exports",
-              desc: "Download your processed files in crisp .jpg format ready for print.",
+              title: "Pro-Grade Export",
+              desc: "Download your final images in pristine print-ready high resolution quality.",
               color: "bg-pink-100 text-pink-600"
             }
           ].map((feat, i) => (
