@@ -6,8 +6,9 @@ const inter = Inter({ subsets: ["latin"], variable: "--font-inter" });
 const outfit = Outfit({ subsets: ["latin"], variable: "--font-outfit" });
 
 export const metadata: Metadata = {
-  title: "Photo & Document Studio | Premium Processing",
-  description: "Upload, crop, and transform your photos and documents with professional tools.",
+  title: "Nandan Digital Studio — Photo Editor",
+  description:
+    "Crop, remove backgrounds, adjust, and export print-ready photos with AI",
   authors: [{ name: "Nandan Digital Studio" }],
 };
 
@@ -18,10 +19,7 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en" className={`${inter.variable} ${outfit.variable}`}>
-      <body className="antialiased">
-        <div className="fixed inset-0 -z-10 bg-[url('https://grainy-gradients.vercel.app/noise.svg')] opacity-20 pointer-events-none" />
-        {children}
-      </body>
+      <body className="antialiased">{children}</body>
     </html>
   );
 }

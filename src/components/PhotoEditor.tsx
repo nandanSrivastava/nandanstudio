@@ -3,15 +3,17 @@
 import React, { useState, useRef, useEffect } from "react";
 import ReactCrop, { Crop, PixelCrop, centerCrop, makeAspectCrop } from "react-image-crop";
 import "react-image-crop/dist/ReactCrop.css";
-import { Download, Scissors, Wand2, RefreshCcw, Loader2, ArrowLeft, Check, Scale, ImagePlus, ChevronDown, Camera } from "lucide-react";
-import { motion } from "framer-motion";
-import confetti from "canvas-confetti";
+import { Download, Scissors, Wand2, RefreshCcw, Loader2, ArrowLeft, Check, Scale, ImagePlus, ChevronDown, Camera, Lock, Sliders } from "lucide-react";
 import { removeBackground } from "@imgly/background-removal";
+import { dataUrlWithDpi } from "@/lib/imageDpi";
 
 interface PhotoEditorProps {
   imageSrc: string;
   onReset: () => void;
 }
+
+// DPI used for exports when no fixed physical print size is selected.
+const PRINT_DPI = 300;
 
 const PRESETS = [
   { label: '1.2" x 1.5"', width: 1.2, height: 1.5, aspect: 1.2 / 1.5 },
@@ -32,10 +34,22 @@ const BG_COLORS = [
   { name: 'Custom', value: 'custom' },
 ];
 
+type ModelId = "isnet_quint8" | "isnet_fp16" | "isnet";
+
+// Background-removal models, ordered fastest -> highest quality. Bigger models download more on the
+// first run (then cached) and take longer per image, but leave less background behind.
+const MODELS: { id: ModelId; label: string; size: string; desc: string }[] = [
+  { id: "isnet_quint8", label: "Fast", size: "~40MB", desc: "Quickest, works on low-end devices, can leave artifacts" },
+  { id: "isnet_fp16", label: "Balanced", size: "~80MB", desc: "Recommended — clean edges, good speed" },
+  { id: "isnet", label: "Best", size: "~170MB", desc: "Sharpest result, slowest, needs more memory" },
+];
+
 // Helper utility to resize high-resolution images to a max width/height before running
-// local WASM background removal. This drastically reduces processing time from 20s to ~2-3s
-// by preventing the local WASM model from struggling with huge multi-megapixel inputs.
-const resizeImageForWasm = (base64OrBlobUrl: string, maxDimension: number = 800): Promise<string> => {
+// local WASM background removal. The ISNet model works internally at ~1024px, so feeding it
+// roughly that resolution keeps the mask as detailed as the model allows while avoiding the
+// huge multi-megapixel inputs that make inference crawl. We export lossless PNG so we don't
+// bake compression artifacts into the data the model sees.
+const resizeImageForWasm = (base64OrBlobUrl: string, maxDimension: number = 1024): Promise<string> => {
   return new Promise((resolve) => {
     const img = new Image();
     img.crossOrigin = "anonymous";
@@ -70,6 +84,8 @@ const resizeImageForWasm = (base64OrBlobUrl: string, maxDimension: number = 800)
         return;
       }
 
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = "high";
       ctx.drawImage(img, 0, 0, width, height);
       resolve(canvas.toDataURL("image/png"));
     };
@@ -85,6 +101,8 @@ export default function PhotoEditor({ imageSrc, onReset }: PhotoEditorProps) {
   const [completedCrop, setCompletedCrop] = useState<PixelCrop>();
   const [aspect, setAspect] = useState<number | undefined>(1.2 / 1.5);
   const [isRemovingBg, setIsRemovingBg] = useState(false);
+  const [bgProgress, setBgProgress] = useState(0);
+  const bgTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [isApplyingCrop, setIsApplyingCrop] = useState(false);
   const [isCropping, setIsCropping] = useState(false);
   const [processedImage, setProcessedImage] = useState<string | null>(imageSrc);
@@ -102,6 +120,14 @@ export default function PhotoEditor({ imageSrc, onReset }: PhotoEditorProps) {
   const [originalRatio, setOriginalRatio] = useState<number>(1);
   const [estimatedSizeKB, setEstimatedSizeKB] = useState<number>(0);
 
+  // Physical print size the current crop is meant to be, in inches. Used to embed the
+  // correct DPI in the exported file so it prints at the right size (e.g. in CorelDRAW).
+  // null = no fixed physical size (Square / Free / pixel crops) -> falls back to PRINT_DPI.
+  const [targetInches, setTargetInches] = useState<{ w: number; h: number } | null>({
+    w: 1.2,
+    h: 1.5,
+  });
+
   // Adjustment sliders
   const [brightness, setBrightness] = useState(100);
   const [contrast, setContrast] = useState(100);
@@ -118,6 +144,67 @@ export default function PhotoEditor({ imageSrc, onReset }: PhotoEditorProps) {
   const [outlineColor, setOutlineColor] = useState<string>('#000000');
   const [cornerRadius, setCornerRadius] = useState<number>(0);
   const [cardShadow, setCardShadow] = useState<string>('none');
+
+  // Clear the background-removal progress timer if the component unmounts mid-run.
+  useEffect(() => {
+    return () => {
+      if (bgTimerRef.current) clearInterval(bgTimerRef.current);
+    };
+  }, []);
+
+  // Export options. PNG = lossless / keeps transparency, JPEG = smaller files with adjustable quality.
+  const [exportFormat, setExportFormat] = useState<'png' | 'jpeg'>('jpeg');
+  const [jpegQuality, setJpegQuality] = useState<number>(95);
+
+  // A transparent background can only be preserved in PNG, so JPEG is meaningless there.
+  const effectiveFormat: 'png' | 'jpeg' = bgColor === 'transparent' ? 'png' : exportFormat;
+
+  // Background-removal model selection, gated behind a server-verified password.
+  const [selectedModel, setSelectedModel] = useState<ModelId>("isnet_fp16");
+  const [isModelUnlocked, setIsModelUnlocked] = useState(false);
+  const [isModelPanelOpen, setIsModelPanelOpen] = useState(false);
+  const [modelPasswordInput, setModelPasswordInput] = useState("");
+  const [modelError, setModelError] = useState("");
+  const [isUnlocking, setIsUnlocking] = useState(false);
+
+  // Restore the unlocked state from the signed (httpOnly) session cookie after a reload.
+  useEffect(() => {
+    let active = true;
+    fetch("/api/unlock-model")
+      .then((res) => res.json())
+      .then((data) => {
+        if (active && data?.unlocked) setIsModelUnlocked(true);
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const handleUnlockSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (isUnlocking) return;
+    setIsUnlocking(true);
+    setModelError("");
+    try {
+      const res = await fetch("/api/unlock-model", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ password: modelPasswordInput }),
+      });
+      const data = await res.json();
+      if (res.ok && data?.success) {
+        setIsModelUnlocked(true);
+        setModelPasswordInput("");
+      } else {
+        setModelError(data?.error || "Incorrect password.");
+      }
+    } catch {
+      setModelError("Could not reach the server. Please try again.");
+    } finally {
+      setIsUnlocking(false);
+    }
+  };
 
   // Keep track of dimensions and compute original parameters on base64 change
   useEffect(() => {
@@ -170,6 +257,9 @@ export default function PhotoEditor({ imageSrc, onReset }: PhotoEditorProps) {
         canvas.height = resizeHeight;
         const ctx = canvas.getContext("2d");
         if (!ctx) return;
+
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = "high";
 
         const drawMainImage = () => {
           // Apply css-like color adjustments
@@ -240,13 +330,17 @@ export default function PhotoEditor({ imageSrc, onReset }: PhotoEditorProps) {
             }
           }
 
-          // Export directly as JPG at 0.9 quality to measure exact file size
-          const dataUrl = canvas.toDataURL("image/jpeg", 0.9);
-          
+          // Encode with the same format/quality the user will download, for an accurate estimate
+          const dataUrl =
+            effectiveFormat === "png"
+              ? canvas.toDataURL("image/png")
+              : canvas.toDataURL("image/jpeg", jpegQuality / 100);
+
           // Exact base64 to byte length conversion:
-          const base64Length = dataUrl.length - "data:image/jpeg;base64,".length;
+          const commaIndex = dataUrl.indexOf(",") + 1;
+          const base64Length = dataUrl.length - commaIndex;
           const sizeInBytes = (base64Length * 3) / 4 - (dataUrl.endsWith("==") ? 2 : dataUrl.endsWith("=") ? 1 : 0);
-          
+
           setEstimatedSizeKB(Math.round(sizeInBytes / 1024));
         };
 
@@ -308,7 +402,9 @@ export default function PhotoEditor({ imageSrc, onReset }: PhotoEditorProps) {
     outlineWidth,
     outlineColor,
     cornerRadius,
-    cardShadow
+    cardShadow,
+    effectiveFormat,
+    jpegQuality
   ]);
 
   const updateCropFromDimensions = (w: number, h: number) => {
@@ -403,12 +499,6 @@ export default function PhotoEditor({ imageSrc, onReset }: PhotoEditorProps) {
     setCompletedCrop(undefined);
     setIsApplyingCrop(false);
     setIsCropping(false);
-    
-    confetti({
-      particleCount: 40,
-      spread: 50,
-      origin: { y: 0.8 }
-    });
   };
 
   const startCropping = () => {
@@ -462,6 +552,10 @@ export default function PhotoEditor({ imageSrc, onReset }: PhotoEditorProps) {
 
     canvas.width = resizeWidth || width;
     canvas.height = resizeHeight || height;
+
+    // High-quality resampling so resized/upscaled exports stay crisp
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = "high";
 
     const drawAndSave = () => {
       // Apply adjustments (brightness, contrast, saturation) to the downloaded canvas
@@ -525,17 +619,29 @@ export default function PhotoEditor({ imageSrc, onReset }: PhotoEditorProps) {
         }
       }
 
-      const base64Image = canvas.toDataURL("image/jpeg", 0.95);
+      // PNG = lossless (and the only format that keeps a transparent background);
+      // JPEG = smaller file at the user-selected quality.
+      const base64Image =
+        effectiveFormat === "png"
+          ? canvas.toDataURL("image/png")
+          : canvas.toDataURL("image/jpeg", jpegQuality / 100);
+      const ext = effectiveFormat === "png" ? "png" : "jpg";
+
+      // Embed physical resolution so the file prints at the intended size. If the crop has a
+      // known physical size (e.g. 1.2"), the DPI is derived from the exported pixel width so
+      // it maps exactly to those inches; otherwise we default to PRINT_DPI.
+      const dpi =
+        targetInches && targetInches.w > 0
+          ? Math.max(1, Math.round(canvas.width / targetInches.w))
+          : PRINT_DPI;
+      const blob = dataUrlWithDpi(base64Image, dpi, dpi);
+      const url = URL.createObjectURL(blob);
+
       const link = document.createElement("a");
-      link.download = `studio-photo-${Date.now()}.jpg`;
-      link.href = base64Image;
+      link.download = `studio-photo-${Date.now()}.${ext}`;
+      link.href = url;
       link.click();
-      
-      confetti({
-        particleCount: 100,
-        spread: 70,
-        origin: { y: 0.8 }
-      });
+      setTimeout(() => URL.revokeObjectURL(url), 10000);
     };
 
     // Render background image, gradient or color
@@ -584,17 +690,48 @@ export default function PhotoEditor({ imageSrc, onReset }: PhotoEditorProps) {
   const handleRemoveBackground = async () => {
     if (!processedImage) return;
     setIsRemovingBg(true);
-    try {
-      // Optimize: Downsample high-res images to max 800px dimension first
-      // This reduces processing time from 20s to ~2-3s because WASM handles smaller matrices incredibly fast.
-      const resizedBase64 = await resizeImageForWasm(processedImage, 800);
+    setBgProgress(0);
 
-      const localBlob = await removeBackground(resizedBase64, {
-        model: "isnet_quint8", // Smallest and fastest quantized model (~44MB)
-        progress: (status, progress) => {
-          console.log(`${status}: ${progress}`);
-        }
-      });
+    // Smoothly creep the progress toward ~92% so the reveal always feels alive even when the
+    // library can't report fine-grained progress (e.g. during on-device inference). Real download
+    // progress events below push it forward faster; completion snaps it to 100%.
+    if (bgTimerRef.current) clearInterval(bgTimerRef.current);
+    bgTimerRef.current = setInterval(() => {
+      setBgProgress((p) => (p < 92 ? p + Math.max(0.4, (92 - p) * 0.05) : p));
+    }, 120);
+
+    try {
+      // Feed the model roughly its native working resolution (~1024px). Going lower (the old 800px)
+      // throws away edge detail and leaves stray background behind; going much higher just costs time
+      // because the ISNet network resizes internally anyway.
+      const resizedBase64 = await resizeImageForWasm(processedImage, 1024);
+
+      // Run the higher-accuracy fp16 model, exporting a lossless PNG cutout (subject + transparent
+      // background). Prefer WebGPU when the browser exposes it, but some browsers report support and
+      // still fail to initialise the GPU backend, so fall back to CPU rather than erroring out.
+      const runRemoval = (device: "gpu" | "cpu") =>
+        removeBackground(resizedBase64, {
+          model: selectedModel, // Chosen in the (password-gated) model picker; defaults to balanced fp16
+          device,
+          output: { format: "image/png", quality: 1 },
+          progress: (key: string, current: number, total: number) => {
+            if (total > 0) {
+              const pct = (current / total) * 100;
+              // Never move backward, and leave headroom (cap 90%) for the final compositing step.
+              setBgProgress((p) => Math.max(p, Math.min(90, pct)));
+            }
+          },
+        });
+
+      const supportsGpu = typeof navigator !== "undefined" && "gpu" in navigator;
+
+      let cutoutBlob: Blob;
+      try {
+        cutoutBlob = await runRemoval(supportsGpu ? "gpu" : "cpu");
+      } catch (gpuErr) {
+        console.warn("GPU background removal failed; retrying on CPU.", gpuErr);
+        cutoutBlob = await runRemoval("cpu");
+      }
 
       // Load original high-res image
       const originalImg = new Image();
@@ -603,58 +740,146 @@ export default function PhotoEditor({ imageSrc, onReset }: PhotoEditorProps) {
         originalImg.onload = resolve;
       });
 
-      // Load the low-res transparent cutout
-      const cutoutUrl = URL.createObjectURL(localBlob);
-      const cutoutImg = new Image();
-      cutoutImg.src = cutoutUrl;
+      // Load the (low-res) transparent cutout returned by the model; its alpha channel is the mask
+      const maskUrl = URL.createObjectURL(cutoutBlob);
+      const maskImg = new Image();
+      maskImg.src = maskUrl;
       await new Promise((resolve) => {
-        cutoutImg.onload = resolve;
+        maskImg.onload = resolve;
       });
+
+      const fullW = originalImg.naturalWidth;
+      const fullH = originalImg.naturalHeight;
 
       // Create a canvas at original high-res dimensions
       const highResCanvas = document.createElement("canvas");
-      highResCanvas.width = originalImg.naturalWidth;
-      highResCanvas.height = originalImg.naturalHeight;
+      highResCanvas.width = fullW;
+      highResCanvas.height = fullH;
       const hrCtx = highResCanvas.getContext("2d");
-      
-      if (hrCtx) {
-        // Draw the high-res original image first
-        hrCtx.drawImage(originalImg, 0, 0);
 
-        // Draw the cutout image scaled up on a mask canvas to isolate the alpha channel
+      if (hrCtx) {
+        hrCtx.imageSmoothingEnabled = true;
+        hrCtx.imageSmoothingQuality = "high";
+
+        // Draw the high-res original image first
+        hrCtx.drawImage(originalImg, 0, 0, fullW, fullH);
+
+        // Smoothly upscale the mask to full resolution on its own canvas so we can refine it
         const maskCanvas = document.createElement("canvas");
-        maskCanvas.width = originalImg.naturalWidth;
-        maskCanvas.height = originalImg.naturalHeight;
+        maskCanvas.width = fullW;
+        maskCanvas.height = fullH;
         const maskCtx = maskCanvas.getContext("2d");
-        
+
         if (maskCtx) {
-          maskCtx.drawImage(cutoutImg, 0, 0, originalImg.naturalWidth, originalImg.naturalHeight);
-          
-          // Apply destination-in to clip the high-res pixels with the scaled mask
-          hrCtx.globalCompositeOperation = 'destination-in';
+          maskCtx.imageSmoothingEnabled = true;
+          maskCtx.imageSmoothingQuality = "high";
+          maskCtx.drawImage(maskImg, 0, 0, fullW, fullH);
+
+          // The cutout's alpha channel is our mask. We (1) smoothstep it so faint background
+          // ghosting goes fully transparent, then (2) erode (shrink) the mask by a couple of pixels
+          // to cut away the contaminated edge ring that still carries the old background colour
+          // (e.g. a blue halo from a blue backdrop). RGB is forced to white so the later
+          // destination-in keeps the original subject colours untouched.
+          try {
+            const maskData = maskCtx.getImageData(0, 0, fullW, fullH);
+            const d = maskData.data;
+            const total = fullW * fullH;
+            const low = 50;   // alpha below this => background (fully cut out)
+            const high = 205; // alpha above this => solid subject
+
+            // 1. Smoothstep the raw alpha into a working buffer.
+            const src = new Uint8ClampedArray(total);
+            for (let p = 0, i = 3; p < total; p++, i += 4) {
+              const a = d[i];
+              if (a <= low) {
+                src[p] = 0;
+              } else if (a >= high) {
+                src[p] = 255;
+              } else {
+                const t = (a - low) / (high - low);
+                src[p] = Math.round(t * t * (3 - 2 * t) * 255);
+              }
+            }
+
+            // 2. Erode by a radius proportional to how much we upscaled the mask, so the colour
+            // fringe (which is roughly one model-pixel wide) is removed at any resolution.
+            const scale = fullW / Math.max(1, maskImg.naturalWidth || fullW);
+            const radius = Math.min(5, Math.max(1, Math.round(scale * 1.5)));
+
+            // Separable min-filter: horizontal pass into `tmp`, vertical pass back into alpha.
+            const tmp = new Uint8ClampedArray(total);
+            for (let y = 0; y < fullH; y++) {
+              const row = y * fullW;
+              for (let x = 0; x < fullW; x++) {
+                let m = 255;
+                const x0 = Math.max(0, x - radius);
+                const x1 = Math.min(fullW - 1, x + radius);
+                for (let xx = x0; xx <= x1; xx++) {
+                  const v = src[row + xx];
+                  if (v < m) m = v;
+                }
+                tmp[row + x] = m;
+              }
+            }
+            for (let x = 0; x < fullW; x++) {
+              for (let y = 0; y < fullH; y++) {
+                let m = 255;
+                const y0 = Math.max(0, y - radius);
+                const y1 = Math.min(fullH - 1, y + radius);
+                for (let yy = y0; yy <= y1; yy++) {
+                  const v = tmp[yy * fullW + x];
+                  if (v < m) m = v;
+                }
+                const i = (y * fullW + x) * 4;
+                d[i] = 255;
+                d[i + 1] = 255;
+                d[i + 2] = 255;
+                d[i + 3] = m;
+              }
+            }
+            maskCtx.putImageData(maskData, 0, 0);
+          } catch (refineErr) {
+            // getImageData can throw on a tainted canvas; fall back to the raw upscaled mask.
+            console.warn("Alpha refinement skipped:", refineErr);
+          }
+
+          // Clip the high-res pixels with the refined full-res mask
+          hrCtx.globalCompositeOperation = "destination-in";
           hrCtx.drawImage(maskCanvas, 0, 0);
+          hrCtx.globalCompositeOperation = "source-over";
         }
-        
-        // Output the high-res cropped cutout as a data URL
+
+        // Output the high-res cutout (PNG keeps the transparency)
         const highResBase64 = highResCanvas.toDataURL("image/png");
         setProcessedImage(highResBase64);
+        // A cutout is only meaningful on a transparent canvas, so default the background to none.
+        setBgColor("transparent");
       } else {
         // Fallback if canvas context fails
-        setProcessedImage(cutoutUrl);
+        setProcessedImage(maskUrl);
       }
 
-      // Cleanup low-res blob URL
-      URL.revokeObjectURL(cutoutUrl);
+      // Cleanup mask blob URL
+      URL.revokeObjectURL(maskUrl);
 
-      confetti({
-        particleCount: 50,
-        spread: 60,
-        origin: { y: 0.8 }
-      });
+      // Snap to 100% and let the reveal finish wiping the blur away before we hide the overlay.
+      if (bgTimerRef.current) {
+        clearInterval(bgTimerRef.current);
+        bgTimerRef.current = null;
+      }
+      setBgProgress(100);
+      await new Promise((r) => setTimeout(r, 450));
     } catch (error) {
       console.error("Local background removal failed:", error);
-      alert("Background removal failed. Please check your device capability or try another photo.");
+      const detail = error instanceof Error ? error.message : String(error);
+      alert(
+        `Background removal failed.\n\n${detail}\n\nTip: the model file (tens of MB) downloads on first use \u2014 check your connection, or try the "Fast" model from Change.`
+      );
     } finally {
+      if (bgTimerRef.current) {
+        clearInterval(bgTimerRef.current);
+        bgTimerRef.current = null;
+      }
       setIsRemovingBg(false);
     }
   };
@@ -677,28 +902,23 @@ export default function PhotoEditor({ imageSrc, onReset }: PhotoEditorProps) {
 
   return (
     <div className="flex flex-col xl:flex-row gap-8 items-start max-w-[1550px] mx-auto p-4">
-      <div className="flex-1 glass rounded-3xl p-6 overflow-hidden w-full min-w-[320px]">
+      <div className="flex-1 glass rounded-xl p-6 overflow-hidden w-full min-w-[320px]">
         <div className="flex items-center justify-between mb-6">
           <div className="flex items-center gap-4">
             <button
               onClick={onReset}
-              className="p-2 rounded-full bg-slate-100 hover:bg-slate-200 transition-colors"
-              title="Back to Upload"
+              className="p-2 rounded-lg bg-slate-100 hover:bg-slate-200 transition-colors"
+              title="Back to upload"
             >
               <ArrowLeft className="w-5 h-5 text-slate-600" />
             </button>
-            <h2 className="text-xl font-bold text-slate-800 flex items-center gap-3">
-              <div className="p-2.5 rounded-2xl bg-indigo-50 text-indigo-600 border border-indigo-100 flex items-center justify-center shadow-sm">
+            <h2 className="flex items-center gap-2.5">
+              <span className="flex h-9 w-9 items-center justify-center rounded-lg bg-slate-100 text-slate-600">
                 <Camera className="w-5 h-5" />
-              </div>
-              <div className="flex flex-col">
-                <span className="text-slate-800 leading-tight font-black text-lg tracking-tight">
-                  Photo Editor
-                </span>
-                <span className="text-[9px] font-bold text-slate-400 uppercase tracking-widest leading-none mt-1">
-                  Console Workspace
-                </span>
-              </div>
+              </span>
+              <span className="text-base font-semibold tracking-tight text-slate-900">
+                Editor
+              </span>
             </h2>
           </div>
           <button
@@ -712,13 +932,13 @@ export default function PhotoEditor({ imageSrc, onReset }: PhotoEditorProps) {
               setCornerRadius(0);
               setCardShadow('none');
             }}
-            className="text-sm text-slate-400 hover:text-slate-600 transition-colors flex items-center gap-1"
+            className="text-sm text-slate-500 hover:text-slate-700 transition-colors flex items-center gap-1.5"
           >
-            <RefreshCcw className="w-4 h-4" /> Reset All
+            <RefreshCcw className="w-4 h-4" /> Reset all
           </button>
         </div>
 
-        <div className="relative bg-slate-200 rounded-xl overflow-hidden flex justify-center items-center min-h-[400px]">
+        <div className="relative checkerboard rounded-xl overflow-hidden flex justify-center items-center min-h-[400px] border border-slate-200">
           {isCropping ? (
             <ReactCrop
               crop={crop}
@@ -759,24 +979,50 @@ export default function PhotoEditor({ imageSrc, onReset }: PhotoEditorProps) {
               }}
             />
           )}
+
+          {/* Background-removal progress: a frosted layer that wipes away top-to-bottom. */}
+          {isRemovingBg && (
+            <div className="absolute inset-0 z-30 overflow-hidden pointer-events-none select-none">
+              {/* Frosted layer covering the not-yet-processed (lower) portion; recedes downward. */}
+              <div
+                className="absolute inset-x-0 bottom-0 backdrop-blur-md bg-white/40 transition-[height] duration-150 ease-linear"
+                style={{ height: `${100 - bgProgress}%` }}
+              />
+              {/* Glowing scan line at the reveal boundary. */}
+              <div
+                className="absolute inset-x-0 transition-[top] duration-150 ease-linear"
+                style={{ top: `${bgProgress}%` }}
+              >
+                <div className="h-0.5 w-full bg-indigo-500/90 shadow-[0_0_14px_3px_rgba(99,102,241,0.65)]" />
+              </div>
+              {/* Status chip with the live percentage. */}
+              <div className="absolute inset-x-0 bottom-5 flex justify-center">
+                <div className="flex items-center gap-2.5 rounded-full bg-slate-900/85 px-4 py-2 text-white shadow-lg backdrop-blur-sm">
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                  <span className="text-sm font-semibold tabular-nums">{Math.round(bgProgress)}%</span>
+                  <span className="text-xs text-white/70">Removing background</span>
+                </div>
+              </div>
+            </div>
+          )}
         </div>
 
         {/* Action buttons directly below the image canvas */}
-        <div className="flex flex-col sm:flex-row gap-4 mt-6">
+        <div className="flex flex-col sm:flex-row gap-3 mt-6">
           <button
             onClick={handleDownload}
-            className="flex-1 py-4.5 rounded-2xl bg-slate-900 text-white font-extrabold text-lg flex items-center justify-center gap-2 hover:bg-slate-800 hover:scale-[1.01] transition-all active:scale-[0.99] shadow-xl shadow-slate-900/10"
+            className="flex-1 py-3 rounded-lg bg-indigo-600 text-white font-semibold flex items-center justify-center gap-2 hover:bg-indigo-700 transition-colors"
           >
-            <Download className="w-6 h-6" />
-            Download Studio JPG
+            <Download className="w-5 h-5" />
+            Download {effectiveFormat === 'png' ? 'PNG' : 'JPG'}
           </button>
-          
+
           <button
             onClick={onReset}
-            className="px-6 py-4.5 rounded-2xl bg-slate-100 border border-slate-200 text-slate-500 font-bold text-sm flex items-center justify-center gap-2 hover:bg-slate-200 hover:text-slate-700 hover:scale-[1.01] active:scale-[0.99] transition-all"
+            className="px-5 py-3 rounded-lg bg-white border border-slate-200 text-slate-600 font-medium text-sm flex items-center justify-center gap-2 hover:bg-slate-50 transition-colors"
           >
             <RefreshCcw className="w-4 h-4" />
-            Upload Another Photo
+            New photo
           </button>
         </div>
       </div>
@@ -786,14 +1032,20 @@ export default function PhotoEditor({ imageSrc, onReset }: PhotoEditorProps) {
         {/* Column 2: Crop, AI, and Background */}
         <div className="w-full md:w-80 flex flex-col gap-6">
           {/* Crop Controls */}
-        <div className="glass rounded-3xl p-6">
-          <h3 className="text-sm font-medium text-slate-500 uppercase tracking-wider mb-4">1. Crop & Resize</h3>
+        <div className="glass rounded-xl p-6">
+          <h3 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-4">1. Crop & Resize</h3>
           <div className="grid grid-cols-2 gap-3 mb-4">
             {PRESETS.map((p) => (
               <button
                 key={p.label}
                 onClick={() => {
                   setAspect(p.aspect);
+                  // Track the physical print size (if this preset has one) for DPI embedding.
+                  setTargetInches(
+                    typeof p.width === "number" && typeof p.height === "number"
+                      ? { w: p.width, h: p.height }
+                      : null
+                  );
                   setIsCropping(true);
                   if (imgRef.current) {
                     const { width, height } = imgRef.current;
@@ -926,7 +1178,17 @@ export default function PhotoEditor({ imageSrc, onReset }: PhotoEditorProps) {
 
                     const calculatedAspect = pxW / pxH;
                     setAspect(calculatedAspect);
-                    
+
+                    // Remember the physical size for DPI embedding. Pixel crops have no
+                    // fixed physical size, so they fall back to the default print DPI.
+                    if (customCropUnit === "in") {
+                      setTargetInches({ w: wVal, h: hVal });
+                    } else if (customCropUnit === "cm") {
+                      setTargetInches({ w: wVal / 2.54, h: hVal / 2.54 });
+                    } else {
+                      setTargetInches(null);
+                    }
+
                     if (!isCropping) startCropping();
                     
                     // Allow state update to populate ReactCrop first, then resize selectors
@@ -964,12 +1226,12 @@ export default function PhotoEditor({ imageSrc, onReset }: PhotoEditorProps) {
         </div>
 
         {/* AI Tools */}
-        <div className="glass rounded-3xl p-6">
-          <h3 className="text-sm font-medium text-slate-500 uppercase tracking-wider mb-4">2. AI Magic</h3>
+        <div className="glass rounded-xl p-6">
+          <h3 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-4">2. Background Removal</h3>
           <button
             onClick={handleRemoveBackground}
             disabled={isRemovingBg}
-            className="w-full py-4 rounded-xl bg-gradient-to-r from-brand-primary to-brand-secondary text-white font-bold flex items-center justify-center gap-2 hover:shadow-lg hover:shadow-primary/30 transition-all disabled:opacity-50"
+            className="w-full py-3 rounded-lg bg-indigo-600 text-white font-semibold flex items-center justify-center gap-2 hover:bg-indigo-700 transition-colors disabled:opacity-50"
           >
             {isRemovingBg ? (
               <div className="flex items-center gap-2">
@@ -983,11 +1245,105 @@ export default function PhotoEditor({ imageSrc, onReset }: PhotoEditorProps) {
               </>
             )}
           </button>
+
+          {/* Model selector (password protected) */}
+          <div className="mt-4 pt-4 border-t border-slate-100">
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex flex-col">
+                <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">AI Model</span>
+                <span className="text-sm font-bold text-slate-700">
+                  {MODELS.find((m) => m.id === selectedModel)?.label}
+                  <span className="text-xs font-medium text-slate-400 ml-1">
+                    ({MODELS.find((m) => m.id === selectedModel)?.size})
+                  </span>
+                </span>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setIsModelPanelOpen((v) => !v);
+                  setModelError("");
+                  setModelPasswordInput("");
+                }}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-slate-100 border border-slate-200 text-xs font-bold text-slate-600 hover:bg-slate-200 transition-all"
+              >
+                {isModelUnlocked ? <Sliders className="w-3.5 h-3.5" /> : <Lock className="w-3.5 h-3.5" />}
+                Change
+              </button>
+            </div>
+
+            {isModelPanelOpen && (
+              <div className="mt-3">
+                {!isModelUnlocked ? (
+                  <form
+                    onSubmit={handleUnlockSubmit}
+                    className="flex flex-col gap-2 p-3 rounded-2xl bg-slate-50 border border-slate-200"
+                  >
+                    <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider flex items-center gap-1.5">
+                      <Lock className="w-3 h-3" /> Enter password to change model
+                    </label>
+                    <div className="flex gap-2">
+                      <input
+                        type="password"
+                        value={modelPasswordInput}
+                        onChange={(e) => {
+                          setModelPasswordInput(e.target.value);
+                          setModelError("");
+                        }}
+                        placeholder="Password"
+                        autoFocus
+                        className={`flex-1 min-w-0 px-3 py-2 rounded-xl bg-white border text-xs font-bold text-slate-800 focus:outline-none transition-all ${
+                          modelError ? "border-red-400 focus:border-red-500" : "border-slate-200 focus:border-indigo-600"
+                        }`}
+                      />
+                      <button
+                        type="submit"
+                        disabled={isUnlocking || !modelPasswordInput}
+                        className="px-3.5 py-2 rounded-xl bg-slate-900 text-white text-xs font-bold hover:bg-slate-800 active:scale-[0.98] transition-all disabled:opacity-40 flex items-center gap-1.5"
+                      >
+                        {isUnlocking ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : null}
+                        Unlock
+                      </button>
+                    </div>
+                    {modelError && (
+                      <p className="text-[11px] font-semibold text-red-500">{modelError}</p>
+                    )}
+                  </form>
+                ) : (
+                  <div className="flex flex-col gap-2">
+                    {MODELS.map((m) => (
+                      <button
+                        key={m.id}
+                        type="button"
+                        onClick={() => setSelectedModel(m.id)}
+                        className={`text-left p-3 rounded-2xl border transition-all ${
+                          selectedModel === m.id
+                            ? "bg-indigo-50 border-indigo-600"
+                            : "bg-white border-slate-200 hover:border-slate-300"
+                        }`}
+                      >
+                        <div className="flex items-center justify-between">
+                          <span className={`text-sm font-bold ${selectedModel === m.id ? "text-indigo-700" : "text-slate-700"}`}>
+                            {m.label}
+                          </span>
+                          <span className="text-[10px] font-bold text-slate-400">{m.size}</span>
+                        </div>
+                        <p className="text-[11px] font-medium text-slate-500 mt-0.5 leading-snug">{m.desc}</p>
+                      </button>
+                    ))}
+                    <p className="text-[10px] font-medium text-slate-400 leading-snug mt-0.5">
+                      Bigger models download once (then cached) and run slower, but leave less background behind.
+                    </p>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
         </div>
 
         {/* Background Color */}
-        <div className="glass rounded-3xl p-6">
-          <h3 className="text-sm font-medium text-slate-500 uppercase tracking-wider mb-4">3. Background</h3>
+        <div className="glass rounded-xl p-6">
+          <h3 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-4">3. Background</h3>
           
           <div className="grid grid-cols-5 gap-2 mb-4">
             {BG_COLORS.map((c) => (
@@ -1005,7 +1361,7 @@ export default function PhotoEditor({ imageSrc, onReset }: PhotoEditorProps) {
                 }}
               >
                 {c.value === 'transparent' && (
-                  <div className="w-full h-full bg-[url('https://www.transparenttextures.com/patterns/checkerboard.png')] opacity-10" />
+                  <div className="w-full h-full checkerboard opacity-60" />
                 )}
                 {c.value === 'custom' && (
                   <div className="w-full h-full bg-gradient-to-tr from-red-500 via-green-500 to-blue-500 opacity-40 mix-blend-overlay" />
@@ -1142,8 +1498,8 @@ export default function PhotoEditor({ imageSrc, onReset }: PhotoEditorProps) {
       {/* Column 3: Adjustments and Resizer */}
       <div className="w-full md:w-80 flex flex-col gap-6">
         {/* Image Adjustments */}
-        <div className="glass rounded-3xl p-6">
-          <h3 className="text-sm font-medium text-slate-500 uppercase tracking-wider mb-4">4. Image Adjustments</h3>
+        <div className="glass rounded-xl p-6">
+          <h3 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-4">4. Image Adjustments</h3>
 
           {/* Slider Sliders */}
           <div className="flex flex-col gap-4">
@@ -1313,10 +1669,10 @@ export default function PhotoEditor({ imageSrc, onReset }: PhotoEditorProps) {
         </div>
 
         {/* Dynamic Image Resizer */}
-        <div className="glass rounded-3xl p-6">
+        <div className="glass rounded-xl p-6">
           <div className="flex items-center gap-2 mb-4">
             <Scale className="w-5 h-5 text-indigo-600" />
-            <h3 className="text-sm font-medium text-slate-500 uppercase tracking-wider">5. Custom Resizer</h3>
+            <h3 className="text-xs font-semibold text-slate-500 uppercase tracking-wider">5. Resize &amp; Export</h3>
           </div>
 
           <div className="flex flex-col gap-4">
@@ -1447,6 +1803,63 @@ export default function PhotoEditor({ imageSrc, onReset }: PhotoEditorProps) {
               </div>
             </div>
 
+            {/* Export Format & Quality */}
+            <div className="border-t border-slate-100 pt-4 flex flex-col gap-2">
+              <label className="text-xs font-semibold text-slate-500 block">Download Format</label>
+              <div className="grid grid-cols-2 gap-1.5 bg-slate-100 p-1 rounded-xl">
+                {([
+                  { id: 'jpeg', label: 'JPG' },
+                  { id: 'png', label: 'PNG' },
+                ] as const).map((fmt) => (
+                  <button
+                    key={fmt.id}
+                    type="button"
+                    onClick={() => setExportFormat(fmt.id)}
+                    className={`py-1.5 rounded-lg text-xs font-bold transition-all ${
+                      effectiveFormat === fmt.id
+                        ? 'bg-white text-slate-800 shadow-sm'
+                        : 'text-slate-500 hover:text-slate-700'
+                    }`}
+                  >
+                    {fmt.label}
+                    {fmt.id === 'png' && (
+                      <span className="block text-[9px] font-medium text-slate-400 leading-none mt-0.5">
+                        Lossless · Transparent
+                      </span>
+                    )}
+                    {fmt.id === 'jpeg' && (
+                      <span className="block text-[9px] font-medium text-slate-400 leading-none mt-0.5">
+                        Smaller file
+                      </span>
+                    )}
+                  </button>
+                ))}
+              </div>
+
+              {bgColor === 'transparent' && (
+                <p className="text-[10px] font-medium text-indigo-500">
+                  Transparent background detected — exporting as PNG to keep it.
+                </p>
+              )}
+
+              {effectiveFormat === 'jpeg' && (
+                <div className="flex flex-col gap-1.5 mt-1">
+                  <div className="flex justify-between text-xs font-semibold text-slate-600">
+                    <span>JPG Quality</span>
+                    <span>{jpegQuality}%</span>
+                  </div>
+                  <input
+                    type="range"
+                    min="60"
+                    max="100"
+                    value={jpegQuality}
+                    onChange={(e) => setJpegQuality(parseInt(e.target.value))}
+                    className="w-full h-1.5 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-indigo-600"
+                  />
+                </div>
+              )}
+            </div>
+
             {/* Estimated Size and Status */}
             <div className="mt-2 p-3.5 rounded-2xl bg-indigo-50/50 border border-indigo-100 flex items-center justify-between text-xs">
               <span className="font-semibold text-slate-500">Est. File Size:</span>
@@ -1457,6 +1870,27 @@ export default function PhotoEditor({ imageSrc, onReset }: PhotoEditorProps) {
                 }
               </span>
             </div>
+
+            {/* Physical print size — embedded as DPI metadata in the download so it prints
+                at the right size in CorelDRAW / Photoshop / Word etc. */}
+            {(() => {
+              if (!resizeWidth || !resizeHeight) return null;
+              const dpi =
+                targetInches && targetInches.w > 0
+                  ? Math.max(1, Math.round(resizeWidth / targetInches.w))
+                  : PRINT_DPI;
+              const printW = resizeWidth / dpi;
+              const printH = resizeHeight / dpi;
+              return (
+                <div className="p-3.5 rounded-2xl bg-slate-50 border border-slate-200 flex items-center justify-between text-xs">
+                  <span className="font-semibold text-slate-500">Print Size:</span>
+                  <span className="font-bold text-slate-700">
+                    {printW.toFixed(2)}&Prime; × {printH.toFixed(2)}&Prime;
+                    <span className="ml-1.5 font-medium text-slate-400">@ {dpi} DPI</span>
+                  </span>
+                </div>
+              );
+            })()}
           </div>
         </div>
       </div>
