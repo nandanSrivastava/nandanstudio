@@ -44,6 +44,33 @@ const MODELS: { id: ModelId; label: string; size: string; desc: string }[] = [
   { id: "isnet", label: "Best", size: "~170MB", desc: "Sharpest result, slowest, needs more memory" },
 ];
 
+// A 1x1 image, run through the model once to compile its GPU shaders before the first real photo.
+const BLANK_PNG = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M/wHwAEBgIApD5fRAAAAABJRU5ErkJggg==";
+
+const supportsGpu = () => typeof navigator !== "undefined" && "gpu" in navigator;
+
+// The library keeps one loaded model per config, matched on its JSON form. The warm-up and the real
+// run must both build it here, so that they share that model rather than loading it twice.
+const removalConfig = (model: ModelId, device: "gpu" | "cpu") => ({
+  model,
+  device,
+  output: { format: "image/png" as const, quality: 1 },
+});
+
+// Gets a model ready ahead of the first click. Once per model: the loaded model outlives the editor,
+// so opening the next photo has nothing to redo.
+const warmUps = new Map<ModelId, Promise<unknown>>();
+const warmUp = (model: ModelId) => {
+  let warming = warmUps.get(model);
+  if (!warming) {
+    warming = removeBackground(BLANK_PNG, removalConfig(model, supportsGpu() ? "gpu" : "cpu")).catch((err) =>
+      console.warn("Background removal warm-up failed; the first run will load the model instead.", err)
+    );
+    warmUps.set(model, warming);
+  }
+  return warming;
+};
+
 // Helper utility to resize high-resolution images to a max width/height before running
 // local WASM background removal. The ISNet model works internally at ~1024px, so feeding it
 // roughly that resolution keeps the mask as detailed as the model allows while avoiding the
@@ -166,6 +193,11 @@ export default function PhotoEditor({ imageSrc, onReset }: PhotoEditorProps) {
   const [modelPasswordInput, setModelPasswordInput] = useState("");
   const [modelError, setModelError] = useState("");
   const [isUnlocking, setIsUnlocking] = useState(false);
+
+  // Get the model ready as soon as the editor opens, so the first click is as quick as later ones.
+  useEffect(() => {
+    warmUp(selectedModel);
+  }, [selectedModel]);
 
   // Restore the unlocked state from the signed (httpOnly) session cookie after a reload.
   useEffect(() => {
@@ -706,14 +738,15 @@ export default function PhotoEditor({ imageSrc, onReset }: PhotoEditorProps) {
       // because the ISNet network resizes internally anyway.
       const resizedBase64 = await resizeImageForWasm(processedImage, 1024);
 
+      // A model can't run two images at once, so let a warm-up still in progress finish first.
+      await warmUp(selectedModel);
+
       // Run the higher-accuracy fp16 model, exporting a lossless PNG cutout (subject + transparent
       // background). Prefer WebGPU when the browser exposes it, but some browsers report support and
       // still fail to initialise the GPU backend, so fall back to CPU rather than erroring out.
       const runRemoval = (device: "gpu" | "cpu") =>
         removeBackground(resizedBase64, {
-          model: selectedModel, // Chosen in the (password-gated) model picker; defaults to balanced fp16
-          device,
-          output: { format: "image/png", quality: 1 },
+          ...removalConfig(selectedModel, device), // Model comes from the (password-gated) picker; defaults to balanced fp16
           progress: (key: string, current: number, total: number) => {
             if (total > 0) {
               const pct = (current / total) * 100;
@@ -723,11 +756,9 @@ export default function PhotoEditor({ imageSrc, onReset }: PhotoEditorProps) {
           },
         });
 
-      const supportsGpu = typeof navigator !== "undefined" && "gpu" in navigator;
-
       let cutoutBlob: Blob;
       try {
-        cutoutBlob = await runRemoval(supportsGpu ? "gpu" : "cpu");
+        cutoutBlob = await runRemoval(supportsGpu() ? "gpu" : "cpu");
       } catch (gpuErr) {
         console.warn("GPU background removal failed; retrying on CPU.", gpuErr);
         cutoutBlob = await runRemoval("cpu");
@@ -868,7 +899,7 @@ export default function PhotoEditor({ imageSrc, onReset }: PhotoEditorProps) {
         bgTimerRef.current = null;
       }
       setBgProgress(100);
-      await new Promise((r) => setTimeout(r, 450));
+      await new Promise((r) => setTimeout(r, 160));
     } catch (error) {
       console.error("Local background removal failed:", error);
       const detail = error instanceof Error ? error.message : String(error);
